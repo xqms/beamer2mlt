@@ -16,3 +16,8 @@ beamer2mlt
    2. Create enough video tracks
    3. With the clip selected, run "Timeline -> Current Clip -> Expand Clip"
 
+
+Compilation
+-----------
+
+Needs the following dependencies: `libpoppler-qt6-dev`, `libmlt++-dev`
