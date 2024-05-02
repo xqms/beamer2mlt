@@ -9,10 +9,14 @@
 
 #include <locale.h>
 
+#include <filesystem>
+
 constexpr int WIDTH = 1920;
 constexpr int HEIGHT = 1080;
 constexpr int FPS = 25;
 constexpr int DEFAULT_SLIDE_LENGTH = 100;
+
+namespace fs = std::filesystem;
 
 struct Track
 {
@@ -63,7 +67,19 @@ int main(int argc, char** argv)
         tracks.push_back(std::make_unique<Track>(profile));
 
 
-    QUrl documentUrl{argv[1]};
+    QUrl documentUrl{inputFile};
+    fs::path outputPath = fs::absolute(fs::path{outputFile}).parent_path();
+
+    fs::path slidesDir = outputPath / "slides";
+    if(!fs::exists(slidesDir))
+    {
+        std::error_code ec;
+        if(!fs::create_directory(slidesDir, ec))
+        {
+            fprintf(stderr, "Could not create directory '%s': %s\n", slidesDir.c_str(), ec.message().c_str());
+            return 1;
+        }
+    }
 
     int totalTime = 0;
 
@@ -83,17 +99,17 @@ int main(int argc, char** argv)
         );
         QImage image = page->renderToImage(dpi, dpi);
 
-        auto frameName = QString("frame%1.png").arg(pageNumber, 4, 10, QChar('0'));
-        image.save(frameName);
+        fs::path framePath = slidesDir / QString("slide%1.png").arg(pageNumber, 4, 10, QChar('0')).toStdString();
+        image.save(QString::fromStdString(framePath.string()));
 
-        Mlt::Producer frameProd(profile, "qimage", qPrintable(frameName));
+        Mlt::Producer frameProd(profile, "qimage", framePath.c_str());
 
         int frameLength = DEFAULT_SLIDE_LENGTH;
 
         frameProd.set("hide", 2);
         if(!frameProd.is_valid())
         {
-            fprintf(stderr, "Could not load frame %s into MLT\n", qPrintable(frameName));
+            fprintf(stderr, "Could not load frame %s into MLT\n", framePath.c_str());
             return 1;
         }
 
@@ -182,6 +198,7 @@ int main(int argc, char** argv)
     setlocale(LC_NUMERIC, "C");
 
     Mlt::Consumer consumer(profile, "xml", outputFile);
+    consumer.set("root", outputPath.c_str());
     consumer.connect(tractor);
     consumer.debug();
     consumer.run();
