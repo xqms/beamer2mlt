@@ -27,6 +27,7 @@ struct Track
         playlist.set("hide", 2);
 
         tractor.set_track(playlist, 0);
+        tractor.set("hide", 2);
     }
 
     Mlt::Playlist playlist;
@@ -34,6 +35,13 @@ struct Track
     Mlt::Tractor tractor;
 
     int time = 0;
+};
+
+struct EmbeddedVideo
+{
+    std::unique_ptr<Mlt::Chain> producer;
+    mlt_rect rect;
+    int length;
 };
 
 int main(int argc, char** argv)
@@ -55,17 +63,19 @@ int main(int argc, char** argv)
     }
 
     Mlt::Factory::init();
-    Mlt::Profile profile;
+    Mlt::Profile profile("HD 1080p 25 fps");
     profile.set_width(WIDTH);
     profile.set_height(HEIGHT);
     profile.set_progressive(1);
+    profile.set_sample_aspect(1, 1);
+    profile.set_display_aspect(16, 9);
+    profile.set_colorspace(709);
 
 
     std::vector<std::unique_ptr<Track>> tracks;
 
-    for(int i = 0; i < 8; ++i)
-        tracks.push_back(std::make_unique<Track>(profile));
-
+    // Slide track
+    tracks.push_back(std::make_unique<Track>(profile));
 
     QUrl documentUrl{inputFile};
     fs::path outputPath = fs::absolute(fs::path{outputFile}).parent_path();
@@ -99,12 +109,16 @@ int main(int argc, char** argv)
         );
         QImage image = page->renderToImage(dpi, dpi);
 
-        fs::path framePath = slidesDir / QString("slide%1.png").arg(pageNumber, 4, 10, QChar('0')).toStdString();
+        fs::path framePath = fs::absolute(
+            slidesDir / QString("slide%1.png").arg(pageNumber, 4, 10, QChar('0')).toStdString()
+        );
+
         image.save(QString::fromStdString(framePath.string()));
 
         Mlt::Producer frameProd(profile, "qimage", framePath.c_str());
+        frameProd.set("kdenlive:clip_type", 2);
 
-        int frameLength = DEFAULT_SLIDE_LENGTH;
+        int frameLength = (page->duration() > 0) ? page->duration() : DEFAULT_SLIDE_LENGTH;
 
         frameProd.set("hide", 2);
         if(!frameProd.is_valid())
@@ -113,14 +127,15 @@ int main(int argc, char** argv)
             return 1;
         }
 
-        int trackIdx = 1;
+        std::vector<EmbeddedVideo> videos;
+        int minLength = std::numeric_limits<int>::max();
+        int maxLength = 0;
         for(auto& link : page->links())
         {
             if(link->linkType() != Poppler::Link::Execute)
                 continue;
 
-            if(trackIdx >= tracks.size())
-                break;
+            EmbeddedVideo video;
 
             auto execLink = reinterpret_cast<Poppler::LinkExecute*>(link.get());
 
@@ -130,49 +145,81 @@ int main(int argc, char** argv)
 
             url = url.adjusted(QUrl::RemoveQuery);
 
-            Mlt::Producer producer(profile, qPrintable(url.toString()));
-            if(!producer.is_valid())
+            fs::path videoPath = fs::absolute(url.toString().toStdString());
+
+            video.producer = std::make_unique<Mlt::Chain>(profile, videoPath.c_str());
+            if(!video.producer->is_valid())
             {
-                fprintf(stderr, "Could not load video %s into MLT\n", qPrintable(url.toString()));
+                fprintf(stderr, "Could not load video %s into MLT\n", videoPath.c_str());
                 return 1;
             }
 
-            int my_length = QString(producer.get_length_time(mlt_time_frames)).toInt();
-            frameLength = std::max(my_length, frameLength);
+            video.length = QString(video.producer->get_length_time(mlt_time_frames)).toInt();
+            minLength = std::min(minLength, video.length);
+            maxLength = std::max(maxLength, video.length);
 
-            producer.set("hide", 2);
-
-            Mlt::Filter filter(profile, "qtblend");
-            filter.set("kdenlive_id", "qtblend");
+            video.producer->set("kdenlive:clip_type", 2);
+            video.producer->set("hide", 2);
+            video.producer->set("set.test_audio", 1); // Mutes audio (strange naming)
+            video.producer->set("set.test_image", 0);
+            // video.producer->set("eof", "loop");
 
             auto area = execLink->linkArea().normalized();
             mlt_rect rect;
-            rect.x = (area.left() * WIDTH);
-            rect.y = (area.top() * HEIGHT);
-            rect.w = (area.width() * WIDTH);
-            rect.h = (area.height() * HEIGHT);
-            rect.o = 1.0;
+            video.rect.x = (area.left() * WIDTH);
+            video.rect.y = (area.top() * HEIGHT);
+            video.rect.w = (area.width() * WIDTH);
+            video.rect.h = (area.height() * HEIGHT);
+            video.rect.o = 1.0;
 
-            filter.anim_set("rect", rect, 0);
+            videos.push_back(std::move(video));
+        }
 
-            auto& track = tracks[trackIdx];
-            if(track->time < totalTime)
+        if(!videos.empty())
+        {
+            // Adjust frame duration to match video
+            if(page->duration() < 0)
             {
-                // Insert blank
-                Mlt::Producer blank(profile, "blank");
-                int duration = totalTime - track->time;
-                track->playlist.blank(qPrintable(QString::number(duration)));
-                track->time += duration;
+                frameLength = maxLength;
             }
 
-            track->playlist.append(producer);
+            int trackIdx = 1;
+            for(auto& video : videos)
+            {
+                if(trackIdx >= tracks.size())
+                    tracks.push_back(std::make_unique<Track>(profile));
 
-            // Attach filter to this
-            track->playlist.get_clip(track->playlist.count()-1)->attach(filter);
+                auto& track = tracks[trackIdx];
 
-            track->time += my_length;
+                if(track->time < totalTime)
+                {
+                    // Insert blank to get to start of slide
+                    Mlt::Producer blank(profile, "blank");
+                    int duration = totalTime - track->time;
+                    track->playlist.blank(qPrintable(QString::number(duration)));
+                    track->time += duration;
+                }
 
-            trackIdx++;
+                // Loop the video until end of slide
+                while(track->time < totalTime + frameLength)
+                {
+                    const int remaining = totalTime + frameLength - track->time;
+                    const int clipLen = std::min(remaining, video.length);
+
+                    track->playlist.append(*video.producer, 0, clipLen);
+
+                    // Attach filter to this
+                    Mlt::Filter filter(profile, "qtblend");
+                    filter.set("kdenlive_id", "qtblend");
+                    filter.anim_set("rect", video.rect, 0);
+
+                    track->playlist.get_clip(track->playlist.count()-1)->attach(filter);
+
+                    track->time += clipLen;
+                }
+
+                trackIdx++;
+            }
         }
 
         frameProd.set("length", qPrintable(QString::number(frameLength)));
@@ -183,9 +230,10 @@ int main(int argc, char** argv)
     }
 
     Mlt::Tractor tractor(profile);
+    tractor.set("hide", 2);
     for(int i = 0; i < tracks.size(); ++i)
     {
-        tractor.set_track(tracks[i]->tractor, i);
+        tractor.set_track(tracks[i]->playlist, i);
 
         if(i != 0)
         {
@@ -198,7 +246,6 @@ int main(int argc, char** argv)
     setlocale(LC_NUMERIC, "C");
 
     Mlt::Consumer consumer(profile, "xml", outputFile);
-    consumer.set("root", outputPath.c_str());
     consumer.connect(tractor);
     consumer.debug();
     consumer.run();
